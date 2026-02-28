@@ -32,9 +32,11 @@ class SpawnTool(Tool):
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done."
+            "The subagent will complete the task and report back when done. "
+            "For hard planning or reasoning tasks, pass model='claude-opus-4-6' to use "
+            "the more capable model; omit model for routine tasks (uses the fast default)."
         )
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -48,15 +50,24 @@ class SpawnTool(Tool):
                     "type": "string",
                     "description": "Optional short label for the task (for display)",
                 },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Optional model override for this subagent. "
+                        "Use 'claude-opus-4-6' for complex planning, architecture, or "
+                        "deep reasoning tasks. Omit for quick, routine tasks."
+                    ),
+                },
             },
             "required": ["task"],
         }
-    
-    async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
+
+    async def execute(self, task: str, label: str | None = None, model: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
         return await self._manager.spawn(
             task=task,
             label=label,
+            model=model,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,

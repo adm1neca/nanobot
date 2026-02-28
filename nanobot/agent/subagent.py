@@ -19,7 +19,7 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 
 class SubagentManager:
     """Manages background subagent execution."""
-    
+
     def __init__(
         self,
         provider: LLMProvider,
@@ -32,6 +32,7 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        model_providers: "dict[str, LLMProvider] | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -44,9 +45,25 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        # Maps model-name prefixes (e.g. "claude-") to their LLMProvider instances.
+        # When spawn() is called with a model override, the matching provider is used.
+        self._model_providers: dict[str, LLMProvider] = model_providers or {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
-    
+
+    def _resolve_provider(self, model: str) -> tuple[LLMProvider, str]:
+        """Return (provider, model) for a given model name.
+
+        Checks exact matches first, then prefix matches against model_providers.
+        Falls back to the default provider and model.
+        """
+        if model in self._model_providers:
+            return self._model_providers[model], model
+        for prefix, prov in self._model_providers.items():
+            if model.startswith(prefix):
+                return prov, model
+        return self.provider, model
+
     async def spawn(
         self,
         task: str,
@@ -54,14 +71,24 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        model: str | None = None,
     ) -> str:
-        """Spawn a subagent to execute a task in the background."""
+        """Spawn a subagent to execute a task in the background.
+
+        Args:
+            model: Optional model override (e.g. "claude-opus-4-6" for hard tasks).
+                   When omitted the default model is used.
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
+        effective_provider, effective_model = (
+            self._resolve_provider(model) if model else (self.provider, self.model)
+        )
+
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, effective_provider, effective_model)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -85,10 +112,14 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        provider: LLMProvider | None = None,
+        model: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
-        logger.info("Subagent [{}] starting task: {}", task_id, label)
-        
+        effective_provider = provider or self.provider
+        effective_model = model or self.model
+        logger.info("Subagent [{}] starting task: {} (model={})", task_id, label, effective_model)
+
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
@@ -105,25 +136,26 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
-            
+
+            # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
-            
+
             # Run agent loop (limited iterations)
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
-            
+
             while iteration < max_iterations:
                 iteration += 1
-                
-                response = await self.provider.chat(
+
+                response = await effective_provider.chat(
                     messages=messages,
                     tools=tools.get_definitions(),
-                    model=self.model,
+                    model=effective_model,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,

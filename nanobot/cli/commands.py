@@ -237,6 +237,33 @@ def _make_provider(config: Config):
     )
 
 
+def _make_model_providers(config: Config) -> dict:
+    """Build a model-prefix → LLMProvider map for per-subagent model routing.
+
+    Each configured provider with an API key gets an entry keyed by the
+    canonical model-name prefix it owns (e.g. "anthropic/" for OpenRouter Claude models).
+    The main default provider is intentionally excluded — it is already
+    wired as the SubagentManager's fallback provider.
+    """
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+
+    default_provider_name = config.get_provider_name(config.agents.defaults.model)
+    overrides: dict = {}
+
+    # OpenRouter → prefix "anthropic/" (covers all anthropic/claude-* models on OpenRouter)
+    openrouter = config.providers.openrouter
+    if openrouter.api_key and default_provider_name != "openrouter":
+        overrides["anthropic/"] = LiteLLMProvider(
+            api_key=openrouter.api_key,
+            api_base=openrouter.api_base,
+            default_model="anthropic/claude-opus-4-6",
+            extra_headers=openrouter.extra_headers,
+            provider_name="openrouter",
+        )
+
+    return overrides
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -267,12 +294,13 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    model_providers = _make_model_providers(config)
     session_manager = SessionManager(config.workspace_path)
-    
+
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
-    
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -291,6 +319,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        model_providers=model_providers,
     )
     
     # Set cron callback (needs agent)
@@ -423,6 +452,7 @@ def agent(
     
     bus = MessageBus()
     provider = _make_provider(config)
+    model_providers = _make_model_providers(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -432,7 +462,7 @@ def agent(
         logger.enable("nanobot")
     else:
         logger.disable("nanobot")
-    
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -449,6 +479,7 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        model_providers=model_providers,
     )
     
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -940,6 +971,7 @@ def cron_run(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        model_providers=_make_model_providers(config),
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"
