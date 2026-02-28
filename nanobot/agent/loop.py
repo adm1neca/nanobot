@@ -21,6 +21,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.token_usage import TokenUsageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -120,6 +121,7 @@ class AgentLoop:
         self.tools.register(WebFetchTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(TokenUsageTool(usage_dir=Path("/root/.nanobot/usage")))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -169,6 +171,28 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _record_token_usage(self, response) -> None:
+        """Record token usage from LLM response."""
+        if not response.usage:
+            return
+
+        try:
+            from nanobot.utils.token_tracker import TokenTracker
+            from pathlib import Path
+
+            # In Docker container, usage dir is at /root/.nanobot/usage
+            usage_dir = Path("/root/.nanobot/usage")
+
+            tracker = TokenTracker(usage_dir)
+            tracker.record_usage(
+                model=self.model,
+                prompt_tokens=response.usage.get("prompt_tokens", 0),
+                completion_tokens=response.usage.get("completion_tokens", 0),
+                total_tokens=response.usage.get("total_tokens", 0),
+            )
+        except Exception as e:
+            logger.warning("Failed to record token usage: {}", e)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -190,6 +214,10 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+
+            # Record token usage
+            if response.usage:
+                self._record_token_usage(response)
 
             if response.has_tool_calls:
                 if on_progress:

@@ -113,6 +113,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
+        BotCommand("tokens", "Show token usage overview"),
     ]
     
     def __init__(
@@ -150,6 +151,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
+        self._app.add_handler(CommandHandler("tokens", self._on_tokens))
         
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -308,8 +310,32 @@ class TelegramChannel(BaseChannel):
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
-            "/help — Show available commands"
+            "/help — Show available commands\n"
+            "/tokens — Show token usage overview"
         )
+
+    async def _on_tokens(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /tokens command to show token usage overview."""
+        if not update.message:
+            return
+
+        try:
+            from nanobot.utils.token_tracker import TokenTracker
+            from pathlib import Path
+
+            # In Docker container, usage dir is at /root/.nanobot/usage
+            # which comes from the mounted volume
+            usage_dir = Path("/root/.nanobot/usage")
+
+            tracker = TokenTracker(usage_dir)
+            summary = tracker.format_summary()
+
+            # Split long summaries into multiple messages
+            for chunk in _split_message(summary):
+                await update.message.reply_text(chunk)
+        except Exception as e:
+            logger.error("Failed to get token usage: {}", e)
+            await update.message.reply_text("Unable to retrieve token usage data.")
 
     @staticmethod
     def _sender_id(user) -> str:
