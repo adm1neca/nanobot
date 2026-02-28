@@ -213,6 +213,73 @@ class TestSpawnToolSchema:
 
 
 # ---------------------------------------------------------------------------
+# Token usage is recorded for subagent LLM calls
+# ---------------------------------------------------------------------------
+
+class TestSubagentTokenRecording:
+    def test_record_token_usage_calls_tracker(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+        from unittest.mock import patch
+
+        mgr = SubagentManager(
+            provider=_make_provider(),
+            workspace=MagicMock(),
+            bus=MessageBus(),
+        )
+
+        response = MagicMock()
+        response.usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+
+        with patch("nanobot.agent.subagent.TokenTracker") as MockTracker:
+            mgr._record_token_usage(response, "anthropic/claude-opus-4-6")
+
+        MockTracker.return_value.record_usage.assert_called_once_with(
+            model="anthropic/claude-opus-4-6",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+        )
+
+    def test_record_token_usage_skips_when_no_usage(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+        from unittest.mock import patch
+
+        mgr = SubagentManager(
+            provider=_make_provider(),
+            workspace=MagicMock(),
+            bus=MessageBus(),
+        )
+
+        response = MagicMock()
+        response.usage = None
+
+        with patch("nanobot.agent.subagent.TokenTracker") as MockTracker:
+            mgr._record_token_usage(response, "anthropic/claude-opus-4-6")
+
+        MockTracker.assert_not_called()
+
+    def test_record_token_usage_swallows_errors(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+        from unittest.mock import patch
+
+        mgr = SubagentManager(
+            provider=_make_provider(),
+            workspace=MagicMock(),
+            bus=MessageBus(),
+        )
+
+        response = MagicMock()
+        response.usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+
+        with patch("nanobot.agent.subagent.TokenTracker", side_effect=Exception("disk full")):
+            # Must not raise
+            mgr._record_token_usage(response, "some-model")
+
+
+# ---------------------------------------------------------------------------
 # AgentLoop propagates model_providers to SubagentManager
 # ---------------------------------------------------------------------------
 
