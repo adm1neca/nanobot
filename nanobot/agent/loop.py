@@ -418,7 +418,27 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands\ndeep: <task> — Run task with the most capable model")
+
+        # deep: prefix — deterministic routing to the most capable configured model.
+        # Bypasses the main LLM entirely; the task goes straight to a subagent.
+        if msg.content.strip().lower().startswith("deep:"):
+            task = msg.content.strip()[5:].strip()
+            if not task:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                       content="Usage: deep: <your task>")
+            deep_model = next(
+                (p.default_model for p in self.subagents._model_providers.values()),
+                self.model,
+            )
+            ack = await self.subagents.spawn(
+                task=task,
+                model=deep_model,
+                origin_channel=msg.channel,
+                origin_chat_id=msg.chat_id,
+                session_key=msg.session_key,
+            )
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=ack)
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
