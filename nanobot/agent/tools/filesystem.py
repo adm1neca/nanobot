@@ -7,6 +7,13 @@ from typing import Any
 from nanobot.agent.tools.base import Tool
 
 
+_MEMORY_WRITE_BLOCKED = (
+    "Error: memory/MEMORY.md is managed by the memory consolidation system and cannot be "
+    "written to directly. To capture an idea, note, or task, create a NEW file in "
+    "00-Inbox/ instead (e.g., 00-Inbox/YYYY-MM-DD-HHmm-<slug>.md)."
+)
+
+
 def _resolve_path(
     path: str, workspace: Path | None = None, allowed_dir: Path | None = None
 ) -> Path:
@@ -21,6 +28,11 @@ def _resolve_path(
         except ValueError:
             raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
     return resolved
+
+
+def _is_memory_file(path: Path) -> bool:
+    """Return True if the path is the long-term memory file (write-protected from agent tools)."""
+    return path.name == "MEMORY.md" and path.parent.name == "memory"
 
 
 class _FsTool(Tool):
@@ -61,58 +73,58 @@ class ReadFileTool(_FsTool):
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "The file path to read"},
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start reading from (1-indexed, default 1)",
-                    "minimum": 1,
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read (default 2000)",
-                    "minimum": 1,
-                },
+                "offset": {"type": "integer", "description": "Line number to start at (0-based)", "default": 0},
+                "limit": {"type": "integer", "description": "Max lines to return", "default": self._DEFAULT_LIMIT},
             },
             "required": ["path"],
         }
 
-    async def execute(self, path: str, offset: int = 1, limit: int | None = None, **kwargs: Any) -> str:
+    async def execute(self, path: str, offset: int = 0, limit: int = _DEFAULT_LIMIT, **kwargs: Any) -> str:
         try:
             fp = self._resolve(path)
-            if not fp.exists():
-                return f"Error: File not found: {path}"
-            if not fp.is_file():
-                return f"Error: Not a file: {path}"
+            raw = fp.read_bytes()
+            uses_crlf = b"\r\n" in raw
+            content = raw.decode("utf-8").replace("\r\n", "\n")
+            lines = content.split("\n")
 
-            all_lines = fp.read_text(encoding="utf-8").splitlines()
-            total = len(all_lines)
+            if offset >= len(lines):
+                return f"Error: offset {offset} is beyond file length {len(lines)}"
 
-            if offset < 1:
-                offset = 1
-            if total == 0:
-                return f"(Empty file: {path})"
-            if offset > total:
-                return f"Error: offset {offset} is beyond end of file ({total} lines)"
+            # Always include the offset line and some context after
+            window = lines[offset : offset + limit]
+            visible_start = offset
 
-            start = offset - 1
-            end = min(start + (limit or self._DEFAULT_LIMIT), total)
-            numbered = [f"{start + i + 1}| {line}" for i, line in enumerate(all_lines[start:end])]
-            result = "\n".join(numbered)
+            # Adjust offset downward to show at least 2 lines of context when possible
+            if offset > 1:
+                visible_start = max(0, offset - 2)
+                window = lines[visible_start : offset + limit]
 
-            if len(result) > self._MAX_CHARS:
-                trimmed, chars = [], 0
-                for line in numbered:
-                    chars += len(line) + 1
-                    if chars > self._MAX_CHARS:
-                        break
-                    trimmed.append(line)
-                end = start + len(trimmed)
-                result = "\n".join(trimmed)
+            # Truncate extremely long lines for readability, but include them in the count
+            truncated = []
+            for line in window:
+                if len(line) > 500:
+                    truncated.append(line[:500] + " [...]")
+                else:
+                    truncated.append(line)
 
-            if end < total:
-                result += f"\n\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
-            else:
-                result += f"\n\n(End of file — {total} lines total)"
-            return result
+            result = "\n".join(f"{visible_start + i + 1:6}  {line}" for i, line in enumerate(truncated))
+            total = len(lines)
+            shown = len(window)
+            next_offset = offset + limit
+
+            extra = ""
+            if next_offset < total:
+                extra = f"\n\t\t[{next_offset} more lines available, use offset={next_offset}]"
+            elif offset > 0:
+                extra = "\n\t\t[beginning of file]"
+
+            final_extra = extra
+            if uses_crlf:
+                final_extra = (extra + " (note: file uses CRLF line endings)") if extra else " (note: file uses CRLF line endings)"
+
+            return f"{result}\n\t\t[{shown}/{total} lines shown]{final_extra}"
+        except FileNotFoundError:
+            return f"Error: File not found: {path}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -124,7 +136,7 @@ class ReadFileTool(_FsTool):
 # ---------------------------------------------------------------------------
 
 class WriteFileTool(_FsTool):
-    """Write content to a file."""
+    """Tool to write content to a file (creates or overwrites)."""
 
     @property
     def name(self) -> str:
@@ -132,7 +144,7 @@ class WriteFileTool(_FsTool):
 
     @property
     def description(self) -> str:
-        return "Write content to a file at the given path. Creates parent directories if needed."
+        return "Write content to a file (creates or overwrites). Use it to create new files or replace existing ones entirely."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -147,10 +159,12 @@ class WriteFileTool(_FsTool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            fp = self._resolve(path)
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {len(content)} bytes to {fp}"
+            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            if _is_memory_file(file_path):
+                return _MEMORY_WRITE_BLOCKED
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content, encoding="utf-8")
+            return f"Successfully wrote {len(content)} bytes to {file_path}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -162,33 +176,25 @@ class WriteFileTool(_FsTool):
 # ---------------------------------------------------------------------------
 
 def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
-    """Locate old_text in content: exact first, then line-trimmed sliding window.
+    """Find exact match in content, handling common whitespace issues."""
+    # Direct match first
+    count = content.count(old_text)
+    if count > 0:
+        return old_text, count
 
-    Both inputs should use LF line endings (caller normalises CRLF).
-    Returns (matched_fragment, count) or (None, 0).
-    """
-    if old_text in content:
-        return old_text, content.count(old_text)
-
-    old_lines = old_text.splitlines()
-    if not old_lines:
+    # Try normalized whitespace
+    normalized = old_text.strip()
+    if not normalized:
         return None, 0
-    stripped_old = [l.strip() for l in old_lines]
-    content_lines = content.splitlines()
+    normalized_count = content.count(normalized)
+    if normalized_count > 0:
+        return normalized, normalized_count
 
-    candidates = []
-    for i in range(len(content_lines) - len(stripped_old) + 1):
-        window = content_lines[i : i + len(stripped_old)]
-        if [l.strip() for l in window] == stripped_old:
-            candidates.append("\n".join(window))
-
-    if candidates:
-        return candidates[0], len(candidates)
     return None, 0
 
 
 class EditFileTool(_FsTool):
-    """Edit a file by replacing text with fallback matching."""
+    """Tool to edit a specific portion of a file."""
 
     @property
     def name(self) -> str:
@@ -196,11 +202,7 @@ class EditFileTool(_FsTool):
 
     @property
     def description(self) -> str:
-        return (
-            "Edit a file by replacing old_text with new_text. "
-            "Supports minor whitespace/line-ending differences. "
-            "Set replace_all=true to replace every occurrence."
-        )
+        return "Edit a file by replacing exact text. Provides at least 2 lines of context for safety."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -218,16 +220,30 @@ class EditFileTool(_FsTool):
             "required": ["path", "old_text", "new_text"],
         }
 
+    def _not_found_msg(self, old_text: str, content: str, path: str) -> str:
+        """Build a helpful error message when old_text isn't found."""
+        # Show up to 40 lines of context centered around the search term
+        lines = content.split("\n")
+        for i, line in enumerate(lines):
+            if old_text in line:
+                start = max(0, i - 3)
+                end = min(len(lines), i + 4)
+                context = "\n".join(f"  {i+1:3} | {lines[r]}" for r in range(start, end))
+                return f"Error: Text not found in {path}. Did you mean:\n\n{context}\n\nNote: All indentation must match exactly."
+        return f"Error: Text not found in {path}. Use read_file to see the exact content."
+
     async def execute(
         self, path: str, old_text: str, new_text: str,
         replace_all: bool = False, **kwargs: Any,
     ) -> str:
         try:
-            fp = self._resolve(path)
-            if not fp.exists():
+            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            if _is_memory_file(file_path):
+                return _MEMORY_WRITE_BLOCKED
+            if not file_path.exists():
                 return f"Error: File not found: {path}"
 
-            raw = fp.read_bytes()
+            raw = file_path.read_bytes()
             uses_crlf = b"\r\n" in raw
             content = raw.decode("utf-8").replace("\r\n", "\n")
             match, count = _find_match(content, old_text.replace("\r\n", "\n"))
@@ -245,61 +261,28 @@ class EditFileTool(_FsTool):
             if uses_crlf:
                 new_content = new_content.replace("\n", "\r\n")
 
-            fp.write_bytes(new_content.encode("utf-8"))
-            return f"Successfully edited {fp}"
+            file_path.write_bytes(new_content.encode("utf-8"))
+            return f"Successfully edited {file_path}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error editing file: {e}"
 
-    @staticmethod
-    def _not_found_msg(old_text: str, content: str, path: str) -> str:
-        lines = content.splitlines(keepends=True)
-        old_lines = old_text.splitlines(keepends=True)
-        window = len(old_lines)
-
-        best_ratio, best_start = 0.0, 0
-        for i in range(max(1, len(lines) - window + 1)):
-            ratio = difflib.SequenceMatcher(None, old_lines, lines[i : i + window]).ratio()
-            if ratio > best_ratio:
-                best_ratio, best_start = ratio, i
-
-        if best_ratio > 0.5:
-            diff = "\n".join(difflib.unified_diff(
-                old_lines, lines[best_start : best_start + window],
-                fromfile="old_text (provided)",
-                tofile=f"{path} (actual, line {best_start + 1})",
-                lineterm="",
-            ))
-            return f"Error: old_text not found in {path}.\nBest match ({best_ratio:.0%} similar) at line {best_start + 1}:\n{diff}"
-        return f"Error: old_text not found in {path}. No similar text found. Verify the file content."
-
 
 # ---------------------------------------------------------------------------
-# list_dir
+# list_files
 # ---------------------------------------------------------------------------
 
-class ListDirTool(_FsTool):
-    """List directory contents with optional recursion."""
-
-    _DEFAULT_MAX = 200
-    _IGNORE_DIRS = {
-        ".git", "node_modules", "__pycache__", ".venv", "venv",
-        "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
-        ".ruff_cache", ".coverage", "htmlcov",
-    }
+class ListFilesTool(_FsTool):
+    """Tool to list files in a directory (non-recursive, sorted by mtime)."""
 
     @property
     def name(self) -> str:
-        return "list_dir"
+        return "list_files"
 
     @property
     def description(self) -> str:
-        return (
-            "List the contents of a directory. "
-            "Set recursive=true to explore nested structure. "
-            "Common noise directories (.git, node_modules, __pycache__, etc.) are auto-ignored."
-        )
+        return "List files in a directory (non-recursive), sorted by most recently modified."
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -307,58 +290,25 @@ class ListDirTool(_FsTool):
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "The directory path to list"},
-                "recursive": {
-                    "type": "boolean",
-                    "description": "Recursively list all files (default false)",
-                },
-                "max_entries": {
-                    "type": "integer",
-                    "description": "Maximum entries to return (default 200)",
-                    "minimum": 1,
-                },
             },
             "required": ["path"],
         }
 
-    async def execute(
-        self, path: str, recursive: bool = False,
-        max_entries: int | None = None, **kwargs: Any,
-    ) -> str:
+    async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dp = self._resolve(path)
-            if not dp.exists():
-                return f"Error: Directory not found: {path}"
-            if not dp.is_dir():
+            dir_path = self._resolve(path)
+            if not dir_path.is_dir():
                 return f"Error: Not a directory: {path}"
-
-            cap = max_entries or self._DEFAULT_MAX
-            items: list[str] = []
-            total = 0
-
-            if recursive:
-                for item in sorted(dp.rglob("*")):
-                    if any(p in self._IGNORE_DIRS for p in item.parts):
-                        continue
-                    total += 1
-                    if len(items) < cap:
-                        rel = item.relative_to(dp)
-                        items.append(f"{rel}/" if item.is_dir() else str(rel))
-            else:
-                for item in sorted(dp.iterdir()):
-                    if item.name in self._IGNORE_DIRS:
-                        continue
-                    total += 1
-                    if len(items) < cap:
-                        pfx = "📁 " if item.is_dir() else "📄 "
-                        items.append(f"{pfx}{item.name}")
-
-            if not items and total == 0:
-                return f"Directory {path} is empty"
-
-            result = "\n".join(items)
-            if total > cap:
-                result += f"\n\n(truncated, showing first {cap} of {total} entries)"
-            return result
+            # Sort by mtime, newest first
+            entries = sorted(dir_path.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not entries:
+                return f"Directory is empty: {path}"
+            lines = []
+            for p in entries:
+                suffix = "/" if p.is_dir() else ""
+                size = f" ({p.stat().st_size} bytes)" if p.is_file() else ""
+                lines.append(f"  {p.name}{suffix}{size}")
+            return "\n".join(lines)
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
